@@ -8,7 +8,6 @@ import matplotlib.patheffects as pe
 import numpy as np
 from scipy.optimize import minimize
 import pickle
-import emcee
 import corner
 import os
 import requests
