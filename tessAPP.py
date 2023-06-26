@@ -7,6 +7,7 @@ import cloudpickle
 import pickle
 from tqdm import tqdm
 import warnings
+import pymc as pm
 from scanf import scanf
 import copy
 import pandas as pd
@@ -16,7 +17,7 @@ from IPython.display import display
 
 import os
 
-sys.path.insert(0, '../TESS-plots/code')
+sys.path.insert(0, '../../TESS-plots/code')
 import tessDiffImage
 import tessprfmodel as tprf
 
@@ -155,7 +156,8 @@ class tessAPP:
                  ticData,
                  cleanFiles = True,
                  maxPixelDistance = 3,
-                 usePyMC3 = False,
+                 thinFactor = None,
+                 usePyMC3 = False, # no longer used, thrown away
                  outputDir = "./",
                  spiceFileLocation = "../TESS-plots/",
                  qlpFlagsLocation = "../tessRobovetter/lightcurves/QLP_qflags/"):
@@ -168,10 +170,11 @@ class tessAPP:
         self.outputDir = outputDir
         self.cleanFiles = cleanFiles
         self.maxPixelDistance = maxPixelDistance
-        self.usePyMC3 = usePyMC3
 
         self.spiceFileLocation = spiceFileLocation
         self.qlpFlagsLocation = qlpFlagsLocation
+        
+        self.thinFactor = thinFactor
         
         self.sectorList = None
         self.transitingSectors = None
@@ -312,7 +315,7 @@ class tessAPP:
             # require star to be within 6 pixels to avoid edge effects
             if ((overlapFlux[si]/nCloseSectors>1)) \
                         | ((overlapFlux[si]/nCloseSectors>0.2) \
-                        & (self.sectorData.catalogData["separation"][s] < 27*2)):
+                        & (self.sectorData.catalogData["separation"][s] < 27*2)): # avoid duplicates of the target
                 self.closeEnoughStars.append(s)
 
         print("there are " + str(len(self.closeEnoughStars)) + " close enough stars")
@@ -327,10 +330,18 @@ class tessAPP:
         self.selectedStars = self.closeEnoughStars.copy()
         if 0 not in self.selectedStars:
             self.selectedStars.insert(0,0)
+            
+        if (1 in self.selectedStars) & (self.sectorData.catalogData["separation"][1] == 0):
+            print("removing duplicate target star")
+            self.selectedStars.remove(1)
 
         if len(self.selectedStars) == 1:
-            self.selectedStars.append(1)
-            self.selectedStars.append(2)
+            if self.sectorData.catalogData["separation"][1] > 0:
+                self.selectedStars.append(1)
+                self.selectedStars.append(2)
+            else:
+                self.selectedStars.append(2)
+                self.selectedStars.append(3)
 
         maxRow = max(abs(self.sectorData.ticRow[self.selectedStars] - self.sectorData.catalogData["targetRowPix"]))
         maxCol = max(abs(self.sectorData.ticCol[self.selectedStars] - self.sectorData.catalogData["targetColPix"]))
@@ -344,7 +355,7 @@ class tessAPP:
         if self.closeupSize < 5:
             self.closeupSize = 5
             
-        print("there are " + str(len(self.closeEnoughStars)) + " selected stars")
+        print("there are " + str(len(self.selectedStars)) + " selected stars")
         print(np.array(self.selectedStars))
             
     def collect_sectors(self):
@@ -385,6 +396,7 @@ class tessAPP:
                 colRange = slice(cCol,cCol + self.closeupSize)
                 obs = self.sectorData.diffImageData["diffImage"][rowRange,colRange] \
                                 - np.nanmedian(self.sectorData.diffImageData["diffImage"][rowRange,colRange])
+                obs[obs<0] = 0
                 self.allObsImage.append(obs)
 
                 obs = obs.flatten()
@@ -401,13 +413,6 @@ class tessAPP:
             self.allDiffImageFlat[i] = self.allDiffImageFlat[i][goodData]
 
     def compute_app(self):
-        if self.usePyMC3:
-            print("importing pymc3")
-            import pymc3 as pm
-        else:
-            print("importing pymc")
-            import pymc as pm
-
 
 
         self.modelList = []
@@ -424,8 +429,11 @@ class tessAPP:
                                  sigma=sigmaScale*self.allSigma,
                                  observed=self.allObs)
 
-                traceDiffFit = pm.sample(10000, tune=5000, cores=4, step = pm.Metropolis(), idata_kwargs={"log_likelihood": True})
-                self.traceDict[model] = traceDiffFit
+                traceDiffFit = pm.sample(10000, tune=5000, chains=4, cores=1, step = pm.Metropolis(), idata_kwargs={"log_likelihood": True})
+                if self.thinFactor is None:
+                    self.traceDict[model] = traceDiffFit
+                else:
+                    self.traceDict[model] = traceDiffFit.sel(draw=slice(None,None,self.thinFactor))
 
         with pm.Model() as model:
             model.name = "noTransit"
@@ -438,8 +446,11 @@ class tessAPP:
                              sigma = sigmaScale*self.allSigma,
                              observed=self.allObs)
 
-            traceDiffFit = pm.sample(10000, tune=5000, cores=4, step = pm.Metropolis(), idata_kwargs={"log_likelihood": True})
-            self.traceDict[model] = traceDiffFit
+            traceDiffFit = pm.sample(10000, tune=5000, chains=4, cores=1, step = pm.Metropolis(), idata_kwargs={"log_likelihood": True})
+            if self.thinFactor is None:
+                self.traceDict[model] = traceDiffFit
+            else:
+                self.traceDict[model] = traceDiffFit.sel(draw=slice(None,None,self.thinFactor))
 
         self.dfwaicBma = pm.compare(self.traceDict, ic='WAIC', method="BB-pseudo-BMA")
         self.dfwaicBma.index = [k.name for k,v in self.dfwaicBma.iterrows()]
@@ -457,7 +468,7 @@ class tessAPP:
             name = str(s) + ":" + str(self.sectorData.catalogData["ticID"][s])
             rank.append(self.dfwaicBma.loc[name]["rank"])
             self.weight.append(self.dfwaicBma.loc[name]["weight"])
-            waic.append(self.dfwaicBma.loc[name]["elpd_waic"])
+            waic.append(self.dfwaicBma.loc[name]["p_waic"])
 #         print(rank)
 #         print(self.weight)
 #         print(waic)
@@ -505,12 +516,11 @@ class tessAPP:
 
         print("catalog depth: " + str(self.ticData["planetData"][0]["depth"]))
         for s in range(min(15, len(self.modelList))):
-            if self.usePyMC3:
-                mName = self.modelList[s].name + "_scale"
-                post = self.traceDict[self.modelList[s]][mName]
-            else:
-                mName = self.modelList[s].name + "::scale"
-                post = self.traceDict[self.modelList[s]].posterior[mName][0].values
+            mName = self.modelList[s].name + "::scale"
+            post = self.traceDict[self.modelList[s]].posterior[mName][0].values
+            print(self.modelList[s].name + " scale: "
+                  + str(np.round(np.mean(post),4)) + " +- "
+                  + str(np.round(np.std(post),4)))
             print(self.modelList[s].name + " estimated depth: "
                   + str(np.round(1e-3*np.mean(post),4)) + " +- "
                   + str(np.round(1e-3*np.std(post),4)))
