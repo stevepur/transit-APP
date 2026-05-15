@@ -9,6 +9,8 @@ https://github.com/stevepur/transit-diffImage
 
 corner
 
-pymc
+pymc (>= 6.0.0)
+
+arviz (>= 1.1.0)
 
 tess_stars2px
