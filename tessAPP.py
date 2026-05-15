@@ -8,6 +8,7 @@ import pickle
 from tqdm import tqdm
 import warnings
 import pymc as pm
+import arviz as az
 from scanf import scanf
 import copy
 import pandas as pd
@@ -17,13 +18,13 @@ from IPython.display import display
 
 import os
 
-sys.path.insert(0, '../../TESS-plots/code')
-import tessDiffImage
-import tessprfmodel as tprf
+sys.path.insert(0, '../transit-diffImage')
+from transitDiffImage import tessDiffImage, transitCentroids
+from transitDiffImage import tessprfmodel as tprf
 
 
 class sectorData:
-    def __init__(self, ticName, toiName, sector, outputDir = "./", closeupSize = None):
+    def __init__(self, ticName, planetID, sector, outputDir = "./", closeupSize = None, prfFileLocation = None):
         self.sector = sector
         self.outputDir = outputDir
         self.closeupSize = closeupSize
@@ -38,7 +39,7 @@ class sectorData:
         
     
         try:
-            fName = self.outputDir + ticName + "/imageData_TOI_" + toiName + "_sector" + str(sector) + ".pickle"
+            fName = os.path.join(self.outputDir, ticName, "imageData_" + planetID + "_sector" + str(sector) + ".pickle")
 #            print("loading " + fName)
             f = open(fName, 'rb')
             imageData = cloudpickle.load(f)
@@ -76,7 +77,8 @@ class sectorData:
                     camera = self.targetData["camera"],
                     ccd = self.targetData["ccd"],
                     column=self.catalogData["extent"][0],
-                    row=self.catalogData["extent"][2])
+                    row=self.catalogData["extent"][2],
+                    prfFileLocation = prfFileLocation)
         self.prfExtentLarge = (self.prfLarge.column+0.5, self.prfLarge.column + self.prfLarge.shape[1]+0.5,
                      self.prfLarge.row+0.5, self.prfLarge.row + self.prfLarge.shape[0]+0.5)
         if closeupSize is None:
@@ -88,7 +90,8 @@ class sectorData:
                                     camera = self.targetData['camera'],
                                     ccd = self.targetData['ccd'],
                                     column=np.round(self.catalogData["targetColPix"][0])-(self.closeupSize-1)/2-0.5,
-                                    row=np.round(self.catalogData["targetRowPix"][0])-(self.closeupSize-1)/2-0.5)
+                                    row=np.round(self.catalogData["targetRowPix"][0])-(self.closeupSize-1)/2-0.5,
+                                    prfFileLocation = prfFileLocation)
             self.prfExtent = (self.prf.column, self.prf.column + self.prf.shape[1],
                               self.prf.row, self.prf.row + self.prf.shape[0])
 
@@ -160,11 +163,12 @@ class tessAPP:
                  usePyMC3 = False, # no longer used, thrown away
                  outputDir = "./",
                  spiceFileLocation = "../TESS-plots/",
-                 qlpFlagsLocation = "../tessRobovetter/lightcurves/QLP_qflags/"):
+                 qlpFlagsLocation = "../tessRobovetter/lightcurves/QLP_qflags/",
+                 prfFileLocation = None):
         
         self.ticData = ticData
         self.ticName = "tic" + str(self.ticData["id"])
-        self.toiName = str(self.ticData["planetData"][0]["TOI"])
+        self.planetID = str(self.ticData["planetData"][0]["planetID"])
         self.depthList = self.ticData["planetData"][0]['depth']
         
         self.outputDir = outputDir
@@ -173,7 +177,8 @@ class tessAPP:
 
         self.spiceFileLocation = spiceFileLocation
         self.qlpFlagsLocation = qlpFlagsLocation
-        
+        self.prfFileLocation = prfFileLocation
+
         self.thinFactor = thinFactor
         
         self.sectorList = None
@@ -185,16 +190,18 @@ class tessAPP:
         self.brightEnoughStars = None
         self.closeEnoughStars = None
         self.selectedStars = None
+        self.diffFitData = None
         
         self.firstTransitingSector = 0
         
+        self.weight = []
+        self.starsToDisplay = []
 
 
       
     def make_difference_images(self):
         self.tdi = tessDiffImage.tessDiffImage(self.ticData,
                                                 outputDir = self.outputDir,
-                                               spiceFileLocation = self.spiceFileLocation,
                                                qlpFlagsLocation = self.qlpFlagsLocation,
                                                cleanFiles = self.cleanFiles)
         self.tdi.make_ffi_difference_image(thisPlanet = 0)
@@ -202,7 +209,7 @@ class tessAPP:
         self.sectorList = self.tdi.sectorList
         
     def load_sector(self, sector, closeupSize = None):
-        self.sectorData = sectorData(self.ticName, self.toiName, sector, outputDir = self.outputDir, closeupSize=closeupSize)
+        self.sectorData = sectorData(self.ticName, self.planetID, sector, outputDir = self.outputDir, closeupSize=closeupSize, prfFileLocation=self.prfFileLocation)
             
     def find_first_sector(self):
         sectorIndex = 0
@@ -225,6 +232,10 @@ class tessAPP:
             # remove sectors with negative normalization
             elif self.sectorData.fitCoeff[0] < 0:
                 print("normalization is negative")
+                continue
+            # remove sectors with nan normalization
+            elif np.isnan(self.sectorData.fitCoeff[0]):
+                print("normalization is nan")
                 continue
             # remove sectors where the target is too close to the edge of the CCD
             elif ((self.sectorData.catalogData["refColPix"] < 11) \
@@ -276,6 +287,12 @@ class tessAPP:
         nCloseSectors = 0
         self.lastGoodSector = 0
         overlapFlux = np.zeros(len(self.brightEnoughStars))
+        diffFitData = {}
+        diffFitData["Col"] = []
+        diffFitData["Row"] = []
+        diffFitData["Ra"] = []
+        diffFitData["Dec"] = []
+        diffFitData["Quality"] = []
         for sector in self.transitingSectors:
 #             print("trying sector " + str(sector))
             self.load_sector(sector)
@@ -283,40 +300,112 @@ class tessAPP:
 #             print([len(self.sectorData.diffImageData), len(self.sectorData.catalogData)])
             if len(self.sectorData.diffImageData) == 0:
                 continue
+                
+            try:
+                colRow, prfFitQuality, _, _, _ = transitCentroids.tess_PRF_centroid(self.sectorData.prf, self.sectorData.prfExtent, self.sectorData.diffImageData["diffImage"], self.sectorData.catalogData)
+
+                raDec = tessDiffImage.pix_to_ra_dec(self.sectorData.sector,
+                          self.sectorData.targetData["camera"], self.sectorData.targetData["ccd"],
+                          colRow[0], colRow[1])
+                if prfFitQuality > 0.2:
+                    diffFitData["Col"].append(colRow[0])
+                    diffFitData["Row"].append(colRow[1])
+                    diffFitData["Ra"].append(raDec[0])
+                    diffFitData["Dec"].append(raDec[1])
+                    diffFitData["Quality"].append(prfFitQuality)
+                else:
+                    print("Rejected sector " + str(sector) + " with PRF fit quality " + str(prfFitQuality))
+            except:
+                continue
             
             
+#        if len(diffFitData["Col"]) > 0:
+        if False:
+            print("fit Column")
+            print(diffFitData["Col"])
+            print("fit Row")
+            print(diffFitData["Row"])
+            print("fit RA")
+            print(diffFitData["Ra"])
+            print("fit Dec")
+            print(diffFitData["Dec"])
+            print("fit Quality")
+            print(diffFitData["Quality"])
+            
+            # weight the average by the fit quality
+            diffFitData["meanRa"] = np.average(diffFitData["Ra"], weights=diffFitData["Quality"])
+            diffFitData["meanDec"] = np.average(diffFitData["Dec"], weights=diffFitData["Quality"])
+            # compute weighted standard deviation
+            diffFitData["stdRaArcsec"] = 3600*np.sqrt(np.average((diffFitData["Ra"]-diffFitData["meanRa"])**2, weights=diffFitData["Quality"]))
+            diffFitData["stdDecArcsec"] = 3600*np.sqrt(np.average((diffFitData["Dec"]-diffFitData["meanDec"])**2, weights=diffFitData["Quality"]))
+            diffFitData["stdRadiusArcsec"] = np.sqrt(diffFitData["stdRaArcsec"]**2 + diffFitData["stdDecArcsec"]**2)
+            
+            print("mean RA = " + str(diffFitData["meanRa"]) + " degrees +- " + str(diffFitData["stdRaArcsec"]) + " arcsec")
+            print("mean Dec = " + str(diffFitData["meanDec"]) + " degrees +- " + str(diffFitData["stdDecArcsec"]) + " arcsec")
+            print("standard deviation radius = " + str(diffFitData["stdRadiusArcsec"]))
+            uncertaintyRadius = diffFitData["stdRadiusArcsec"]
+            centerRa = diffFitData["meanRa"]
+            centerDec = diffFitData["meanDec"]
+        else:
+            uncertaintyRadius = 27 # search in two-pixel radius
+            centerRa = self.sectorData.catalogData["correctedRa"][0]
+            centerDec = self.sectorData.catalogData["correctedDec"][0]
+
+
+        for si, s in enumerate(self.brightEnoughStars):
+            dRa = self.sectorData.catalogData["correctedRa"][s] - centerRa
+            dDec = self.sectorData.catalogData["correctedDec"][s] - centerDec
+            dStarArcsec = 3600*np.sqrt((dRa*np.cos(centerDec*np.pi/180.))**2 + dDec**2)
+            # require star to be within 6 pixels to avoid edge effects
+#            if (dStarArcsec < 27/2)
+            if (dStarArcsec < 27/2 + uncertaintyRadius) \
+                & (self.sectorData.catalogData["separation"][s] > 1e-4): # avoid duplicates of the target
+                self.closeEnoughStars.append(s)
+
+        self.diffFitData = diffFitData
+
+
+#        for sector in self.transitingSectors:
+##             print("trying sector " + str(sector))
+#            self.load_sector(sector)
+#
+##             print([len(self.sectorData.diffImageData), len(self.sectorData.catalogData)])
+#            if len(self.sectorData.diffImageData) == 0:
+#                continue
 #             print("loaded sector " + str(sector))
 
-            overlapFluxIndex = np.array([])
-            diffImage = self.sectorData.diffImageData["diffImage"].copy()
-            closeStarsSector = []
-            # normalize to max = 1 to compare hottest pixels
-            diffImage /= np.max(np.max(diffImage))
-            diffImage[diffImage<0] = 0.0
-            sumDiffImage = np.sum(diffImage[diffImage > np.median(diffImage.flatten())])
-            nCloseSectors += 1
+#            overlapFluxIndex = np.array([])
+#            diffImage = self.sectorData.diffImageData["diffImage"].copy()
+#            closeStarsSector = []
+#            # normalize to max = 1 to compare hottest pixels
+#            diffImage /= np.max(np.max(diffImage))
+#            diffImage[diffImage<0] = 0.0
+#            sumDiffImage = np.sum(diffImage[diffImage > np.median(diffImage.flatten())])
+#            nCloseSectors += 1
+#
+#            for si, s in enumerate(self.brightEnoughStars):
+#                if self.sectorData.catalogData["separation"][si] > 27*self.maxPixelDistance:
+#                    continue
+#
+#                pix = self.sectorData.render_star(s, normalizeToObserved = False)
+#                pix /= np.max(np.max(pix))
+#
+#                prod = np.abs(diffImage)*pix
+#
+#                f = np.sum(prod.ravel())
+#                if not np.isnan(f):
+#                    overlapFlux[si] += f
+#                    overlapFluxIndex = np.append(overlapFluxIndex, s)
+#
+##         print("building closeEnoughStars")
+#        for si, s in enumerate(self.brightEnoughStars):
+#            # require star to be within 6 pixels to avoid edge effects
+#            if ((overlapFlux[si]/nCloseSectors>1)) \
+#                        | ((overlapFlux[si]/nCloseSectors>0.2) \
+#                        & (self.sectorData.catalogData["separation"][s] < 27*2)): # avoid duplicates of the target
+#                self.closeEnoughStars.append(s)
 
-            for si, s in enumerate(self.brightEnoughStars):
-                if self.sectorData.catalogData["separation"][si] > 27*self.maxPixelDistance:
-                    continue
-
-                pix = self.sectorData.render_star(s, normalizeToObserved = False)
-                pix /= np.max(np.max(pix))
-
-                prod = np.abs(diffImage)*pix
-
-                f = np.sum(prod.ravel())
-                if not np.isnan(f):
-                    overlapFlux[si] += f
-                    overlapFluxIndex = np.append(overlapFluxIndex, s)
-
-#         print("building closeEnoughStars")
-        for si, s in enumerate(self.brightEnoughStars):
-            # require star to be within 6 pixels to avoid edge effects
-            if ((overlapFlux[si]/nCloseSectors>1)) \
-                        | ((overlapFlux[si]/nCloseSectors>0.2) \
-                        & (self.sectorData.catalogData["separation"][s] < 27*2)): # avoid duplicates of the target
-                self.closeEnoughStars.append(s)
+        
 
         print("there are " + str(len(self.closeEnoughStars)) + " close enough stars")
         print(np.array(self.closeEnoughStars))
@@ -417,7 +506,17 @@ class tessAPP:
 
         self.modelList = []
         self.traceDict = {}
+        if self.thinFactor is None:
+            if len(self.selectedStars) > 50:
+                thinFactor = min(5, int(round(len(self.selectedStars)/25)))
+            else:
+                thinFactor = None
+        else:
+            thinFactor = self.thinFactor
+
         for i, s in enumerate(self.selectedStars):
+            print("computing APP for star " + str(i) + " of " + str(len(self.selectedStars)))
+            sys.stdout.flush()
             with pm.Model() as model:
                 model.name = str(s) + ":" + str(self.sectorData.catalogData["ticID"][s])
                 self.modelList.append(model)
@@ -429,11 +528,12 @@ class tessAPP:
                                  sigma=sigmaScale*self.allSigma,
                                  observed=self.allObs)
 
-                traceDiffFit = pm.sample(10000, tune=5000, chains=4, cores=1, step = pm.Metropolis(), idata_kwargs={"log_likelihood": True})
-                if self.thinFactor is None:
+                traceDiffFit = pm.sample(10000, tune=5000, chains=4, cores=1, progressbar=False, step = pm.Metropolis())
+                pm.compute_log_likelihood(traceDiffFit)
+                if thinFactor is None:
                     self.traceDict[model] = traceDiffFit
                 else:
-                    self.traceDict[model] = traceDiffFit.sel(draw=slice(None,None,self.thinFactor))
+                    self.traceDict[model] = traceDiffFit.sel(draw=slice(None,None,thinFactor))
 
         with pm.Model() as model:
             model.name = "noTransit"
@@ -446,34 +546,39 @@ class tessAPP:
                              sigma = sigmaScale*self.allSigma,
                              observed=self.allObs)
 
-            traceDiffFit = pm.sample(10000, tune=5000, chains=4, cores=1, step = pm.Metropolis(), idata_kwargs={"log_likelihood": True})
-            if self.thinFactor is None:
+            traceDiffFit = pm.sample(10000, tune=5000, chains=4, cores=1, progressbar=False, step = pm.Metropolis())
+            pm.compute_log_likelihood(traceDiffFit)
+            if thinFactor is None:
                 self.traceDict[model] = traceDiffFit
             else:
-                self.traceDict[model] = traceDiffFit.sel(draw=slice(None,None,self.thinFactor))
+                self.traceDict[model] = traceDiffFit.sel(draw=slice(None,None,thinFactor))
+                
+        self.looDict = {}
+        for s in range(len(self.traceDict)):
+            print("computing ELPD for " + self.modelList[s].name)
+            self.looDict[self.modelList[s].name] = az.loo(self.traceDict[list(self.traceDict.keys())[s]])
 
-        self.dfwaicBma = pm.compare(self.traceDict, ic='WAIC', method="BB-pseudo-BMA")
-        self.dfwaicBma.index = [k.name for k,v in self.dfwaicBma.iterrows()]
-        waicDispRange = slice(0,min([len(self.dfwaicBma),15]))
-        display(self.dfwaicBma[waicDispRange])
-        pm.plot_compare(self.dfwaicBma[waicDispRange], insample_dev=False);
-        plt.xlabel("Log WAIC")
-        plt.savefig(self.outputDir + self.ticName + "/" + "TOI_" + self.toiName + "_APP_waic.pdf", bbox_inches='tight')
+
+        self.compareELPD = pm.compare(self.looDict, method="BB-pseudo-BMA")
+        # self.compareELPD.index = [k.name for k,v in self.compareELPD.iterrows()]
+        compareDispRange = slice(0,min([len(self.compareELPD),15]))
+        display(self.compareELPD[compareDispRange])
+        pm.plot_compare(self.compareELPD[compareDispRange]);
+        plt.savefig(os.path.join(self.outputDir, self.ticName, self.planetID + "_APP_LOO.pdf"), bbox_inches='tight')
 
         rank = []
-        self.weight = []
-        waic = []
+        elpd = []
 
         for i, s in enumerate(self.selectedStars):
             name = str(s) + ":" + str(self.sectorData.catalogData["ticID"][s])
-            rank.append(self.dfwaicBma.loc[name]["rank"])
-            self.weight.append(self.dfwaicBma.loc[name]["weight"])
-            waic.append(self.dfwaicBma.loc[name]["p_waic"])
+            rank.append(self.compareELPD.loc[name]["rank"])
+            self.weight.append(self.compareELPD.loc[name]["weight"])
+            elpd.append(self.compareELPD.loc[name]["elpd"])
 #         print(rank)
 #         print(self.weight)
-#         print(waic)
-        waic = np.array(waic)
-        mwaic= waic - np.mean(waic)
+#         print(elpd)
+        elpd = np.array(elpd)
+        melpd = elpd - np.mean(elpd)
 
         print("selected stars:")
         print(np.array(self.selectedStars))
@@ -497,15 +602,16 @@ class tessAPP:
         outputData = {"sortedStars": self.sortedStars,
                         "weights": self.weight,
                         "transitingSectors": self.transitingSectors,
-                        "selectedStars": self.selectedStars}
+                        "selectedStars": self.selectedStars,
+                        "diffFitData": self.diffFitData}
 
-        evalFilename = self.outputDir + self.ticName + "/" + "TOI_" + self.toiName + "_compareData" + ".pickle"
+        evalFilename = os.path.join(self.outputDir, self.ticName, self.planetID + "_compareData" + ".pickle")
         f = open(evalFilename, 'wb')
-        cloudpickle.dump([self.traceDict, self.modelList, self.dfwaicBma, outputData], f, pickle.HIGHEST_PROTOCOL)
+        cloudpickle.dump([self.traceDict, self.modelList, self.compareELPD, outputData], f, pickle.HIGHEST_PROTOCOL)
         f.close()
 
         mostLikelyStar = self.sortedStars[0]
-        print("TOI " + str(self.ticData["planetData"][0]["TOI"])  + ", TIC " + str(self.ticData['id'])\
+        print("TOI " + str(self.ticData["planetData"][0]["planetID"])  + ", TIC " + str(self.ticData['id'])\
               + ": most likely source star index " + str(mostLikelyStar)\
               + ": " + str(self.sectorData.catalogData["ticID"][mostLikelyStar]) \
               + " with probability " + str(np.round(self.sortedWeights[0], 2)) \
@@ -524,6 +630,7 @@ class tessAPP:
             print(self.modelList[s].name + " estimated depth: "
                   + str(np.round(1e-3*np.mean(post),4)) + " +- "
                   + str(np.round(1e-3*np.std(post),4)))
+        sys.stdout.flush()
 
     def draw(self):
         sectorCount = 0
@@ -572,7 +679,7 @@ class tessAPP:
                                      dMagThreshold = 3, magColorBar=False, pixColorBar=False)
                 plt.title("Sector " + str(sector) + " Difference SNR Image")
 
-                plt.savefig(self.outputDir + self.ticName + "/" + "TOI_" + self.toiName + "_sector" + str(sector) + "_APP_overview.pdf", bbox_inches='tight')
+                plt.savefig(os.path.join(self.outputDir, self.ticName, self.planetID + "_sector" + str(sector) + "_APP_overview.pdf"), bbox_inches='tight')
 
                 plt.figure(figsize=(15,15))
                 ax = plt.subplot(2,2,1)
@@ -595,10 +702,13 @@ class tessAPP:
                                               dMagThreshold = 1, magColorBar=False,
                                               pixColorBar=False, ss=1600, fs=14, printMags=True,
                                               starsToAnnotate = self.starsToDisplay)
-                    p = np.round(self.weight[sIndex], 2)
+                    if len(self.weight) > 0:
+                        p = np.round(self.weight[sIndex], 2)
+                    else:
+                        p = 0
                     plt.title("Sector " + str(sector) + " Simulated Difference Image on star " + str(s) + ", p=" + str(p))
 
-                plt.savefig(self.outputDir + self.ticName + "/" + "TOI_" + self.toiName + "_sector" + str(sector) + "_APP_detail.pdf", bbox_inches='tight')
+                plt.savefig(os.path.join(self.outputDir, self.ticName, self.planetID + "_sector" + str(sector) + "_APP_detail.pdf"), bbox_inches='tight')
                 sectorCount += 1
 
     def draw_selected_stars(self, sector, brightEnoughStars = True):
@@ -627,7 +737,7 @@ def set_toi_data(toi, toiTable):
     bjdOffset = 2457000.0
 
     planetData = {}
-    planetData['TOI'] = toi
+    planetData['planetID'] = "TOI_" + str(toi)
     planetData['period'] = toiTable['Period (days)'].values[0]
     planetData['epoch'] = toiTable['Epoch (BJD)'].values[0] - bjdOffset
     planetData['durationHours'] = toiTable['Duration (hours)'].values[0]
@@ -671,7 +781,7 @@ if __name__ == "__main__":
         ticCatalogData['TMag'] = thisToi['TESS Mag'].values[0]
 
         planet0 = set_toi_data(toiNum, thisToi)
-        if os.path.exists(outputDir + "tic" + str(ticCatalogData['id']) + "/TOI_" + str(toiNum) + "_compareData.pickle"):
+        if os.path.exists(os.path.join(outputDir, "tic" + str(ticCatalogData['id']), "TOI_" + str(toiNum) + "_compareData.pickle")):
             continue
 
 
@@ -685,7 +795,7 @@ if __name__ == "__main__":
             ticCatalogData["planetData"].append(set_toi_data(t, thisOtherToi))
 
         ticName = "tic" + str(ticCatalogData["id"])
-        toiName = ticName + "/TOI_" + str(toiNum)
+#        planetID = ticName + "/TOI_" + str(toiNum)
         display(ticCatalogData)
 
         ticData = copy.deepcopy(ticCatalogData)

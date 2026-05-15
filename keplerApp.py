@@ -16,9 +16,7 @@ import pprint
 from astropy.io import fits
 from scipy import stats
 
-import keplerDiffImage as kdi
-import keplerAppReports
-import keplerAppDetailedReports
+from transitDiffImage import keplerDiffImage as kdi
 
 
 class tpfDataClass:
@@ -72,7 +70,7 @@ def draw_pix_image(pixImage, extent, gaiaCatalog, starCol=None, starRow=None):
         plt.scatter(gaiaCatalog["col"][s], gaiaCatalog["row"][s],
                     s=900, marker="*", color="w", edgecolor="k", linewidths=1)
         plt.text(gaiaCatalog["col"][s], gaiaCatalog["row"][s] + 0.2,
-                 str(np.round(gaiaCatalog["phot_g_mean_mag"][s],1)), color="w", fontsize = 24,
+                 str(s) + "," + str(np.round(gaiaCatalog["phot_g_mean_mag"][s],1)), color="w", fontsize = 24,
                  path_effects=[pe.withStroke(linewidth=2,foreground='black')], clip_on=True)
     if starCol is not None:
         for s in range(len(starCol)):
