@@ -11,4 +11,6 @@ corner
 
 pymc
 
+arviz
+
 tess_stars2px
